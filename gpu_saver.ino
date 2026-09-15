@@ -1,53 +1,128 @@
-#include <GyverMAX6675.h>
+#define RELAY_PIN 10
+#define BUTTON_PIN 11
 
-#define CLK_PIN   13 
-#define DATA_PIN  9 
-#define CS_PIN    8 
+#define FULL_SCALE 16.0
+#define TRIP_VOLTAGE 1.65
 
-unsigned long previousMillis = 0; 
-const long interval = 1000;  
+const uint16_t tripADC =
+    TRIP_VOLTAGE * 1023.0 / FULL_SCALE;
 
+const uint16_t resetADC = 5;      // ~0V
 
-int sensorPin = A5; 
-int buttonPin = 11;
-int sensorValue = 0; 
-int buttonState = LOW;
+volatile uint16_t adcValue = 0;
 
-// перед подключением библиотеки можно
-// задать задержку переключения CLK в микросекундах
-// для увеличения качества связи по длинным проводам
-//#define MAX6675_DELAY 10
+enum State {
+    IDLE,
+    WAIT_FOR_RELAY,
+    RUNNING,
+    FAULT
+};
 
-GyverMAX6675<CLK_PIN, DATA_PIN, CS_PIN> sens;
+volatile State state = IDLE;
 
-void setup() {
-  Serial.begin(9600);
-  pinMode(10, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLUP);
-  digitalWrite(10, LOW);
+unsigned long relayStartTime = 0;
+
+void setup()
+{
+    Serial.begin(115200);
+
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    digitalWrite(RELAY_PIN, LOW);
+
+    // ---------- ADC ----------
+    ADMUX = (1 << REFS0) | 5;          // AVcc, A5
+    ADCSRA =
+        (1 << ADEN) |
+        (1 << ADATE) |
+        (1 << ADIE) |
+        (1 << ADSC) |
+        (1 << ADPS2);                  // prescaler = 16
+
+    ADCSRB = 0;                        // free-running
+
+    sei();
 }
 
-void loop() {
-  sensorValue = analogRead(sensorPin);
-  buttonState = digitalRead(buttonPin);
+ISR(ADC_vect)
+{
+    adcValue = ADC;
 
-  if(buttonState == LOW) digitalWrite(10, HIGH);
+    switch (state)
+    {
+        case RUNNING:
+            if (adcValue > tripADC)
+            {
+                PORTB &= ~(1 << PB2);      // Relay OFF immediately
+                state = FAULT;
+            }
+            break;
 
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-    if (sens.readTemp()) {            // Читаем температуру
-      Serial.print("Temp: ");         // Если чтение прошло успешно - выводим в Serial
-      Serial.print(sens.getTemp());   // Забираем температуру через getTemp
-      Serial.print(" *C volts: ");
+        case FAULT:
+            if (adcValue <= resetADC)
+            {
+                state = IDLE;
+            }
+            break;
 
-      Serial.println(sensorValue* 15.25/1023);
-    } else Serial.println("Error");   // ошибка чтения или подключения - выводим лог
-  }
+        default:
+            break;
+    }
+}
 
+void loop()
+{
+    switch (state)
+    {
+        case IDLE:
 
-  if((sensorValue* 15.25/1023) > 1.25){
-    digitalWrite(10, LOW);
-    Serial.println(sensorValue* 15.25/1023);
-  }
+            if (digitalRead(BUTTON_PIN) == LOW)
+            {
+                PORTB |= (1 << PB2);       // Relay ON immediately
+                relayStartTime = millis();
+                state = WAIT_FOR_RELAY;
+            }
+
+            break;
+
+        case WAIT_FOR_RELAY:
+
+            // Wait for relay contacts to physically close
+            if (millis() - relayStartTime >= 10)
+            {
+                state = RUNNING;
+            }
+
+            break;
+
+        case RUNNING:
+            // Nothing needed.
+            // Protection happens inside the ADC interrupt.
+            break;
+
+        case FAULT:
+            // Wait until ADC interrupt clears the fault.
+            break;
+    }
+
+    static unsigned long lastPrint = 0;
+
+    if (millis() - lastPrint >= 500)
+    {
+        lastPrint = millis();
+
+        Serial.print("Voltage: ");
+        Serial.print(adcValue * FULL_SCALE / 1023.0, 2);
+
+        Serial.print("  State: ");
+
+        switch (state)
+        {
+            case IDLE: Serial.println("IDLE"); break;
+            case WAIT_FOR_RELAY: Serial.println("WAIT"); break;
+            case RUNNING: Serial.println("RUNNING"); break;
+            case FAULT: Serial.println("FAULT"); break;
+        }
+    }
 }
